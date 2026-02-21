@@ -3,18 +3,13 @@ import sys
 import glob
 import hashlib
 import json
+import subprocess
 import requests
-from openai import OpenAI
 
 SKILLS_DIR = "skills"
 CACHE_FILE = "scanner/cache.json"
 IGNORE_FILE = "scanner/ignore_list.txt"
-
-client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-
-# ----------------------------
-# Utility Functions
-# ----------------------------
+OLLAMA_MODEL = "llama3"
 
 def load_cache():
     if not os.path.exists(CACHE_FILE):
@@ -41,9 +36,6 @@ def is_ignored(text, ignore_patterns):
             return True
     return False
 
-# ----------------------------
-# AI Analysis
-# ----------------------------
 
 def analyze_file(file_path, content):
     prompt = f"""
@@ -58,38 +50,42 @@ LOW = suspicious but not clearly malicious.
 HIGH = clear malicious intent (exfiltration, override, jailbreak).
 
 If LOW or HIGH:
-- Mention severity
+- Mention severity clearly
 - Explain reason
-- Print suspicious lines.
+- Print suspicious lines
+
+Respond strictly in this format:
+
+Severity: <SAFE | LOW | HIGH>
+Reason:
+Suspicious Lines:
 
 Content:
 {content}
 """
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
+    try:
+        result = subprocess.run(
+            ["ollama", "run", OLLAMA_MODEL],
+            input=prompt,
+            text=True,
+            capture_output=True,
+            timeout=120
+        )
+        return result.stdout.strip()
+    except Exception as e:
+        print(f"❌ Ollama execution failed: {e}")
+        sys.exit(1)
 
-    return response.choices[0].message.content
-
-# ----------------------------
-# PR Comment Function
-# ----------------------------
 
 def comment_on_pr(message):
-    if "GITHUB_EVENT_NAME" not in os.environ:
-        return  # Local run
-
     if os.environ.get("GITHUB_EVENT_NAME") != "pull_request":
         return
 
     repo = os.environ["GITHUB_REPOSITORY"]
     token = os.environ["GITHUB_TOKEN"]
 
-    event_path = os.environ["GITHUB_EVENT_PATH"]
-    with open(event_path) as f:
+    with open(os.environ["GITHUB_EVENT_PATH"]) as f:
         event_data = json.load(f)
 
     pr_number = event_data["pull_request"]["number"]
@@ -103,9 +99,6 @@ def comment_on_pr(message):
 
     requests.post(url, headers=headers, json={"body": message})
 
-# ----------------------------
-# Main Logic
-# ----------------------------
 
 def main():
     print("🔍 Scanning skills folder...\n")
@@ -126,24 +119,23 @@ def main():
 
         current_hash = file_hash(content)
 
-        # Caching
         if file in cache and cache[file] == current_hash:
             print("⏭ Skipped (unchanged file)\n")
             continue
 
         result = analyze_file(file, content)
-
         cache[file] = current_hash
 
-        if "HIGH" in result.upper():
+        print(result)
+        print()
+
+        result_upper = result.upper()
+
+        if "SEVERITY: HIGH" in result_upper:
             malicious_found = True
-            print("🚨 HIGH severity detected!")
-            print(result)
             pr_comment_message += f"### ❌ HIGH in {file}\n```\n{result}\n```\n\n"
 
-        elif "LOW" in result.upper():
-            print("⚠️ LOW severity warning")
-            print(result)
+        elif "SEVERITY: LOW" in result_upper:
             pr_comment_message += f"### ⚠️ LOW in {file}\n```\n{result}\n```\n\n"
 
         else:
